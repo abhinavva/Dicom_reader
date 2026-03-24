@@ -1,0 +1,21 @@
+{
+  "name": "dicom-viewer-bundle",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "build:flutter": "vite build && node scripts/copy-to-flutter.js",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@cornerstonejs/core": "^4.19.0",
+    "@cornerstonejs/tools": "^4.19.0",
+    "@cornerstonejs/dicom-image-loader": "^4.19.0",
+    "dicom-parser": "^1.8.21",
+    "gl-matrix": "^3.4.3"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

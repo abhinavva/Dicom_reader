@@ -1,0 +1,28 @@
+name: dicom_reader
+description: Modern local-study DICOM workstation built with Flutter and Cornerstone3D.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.1
+
+dependencies:
+  collection: ^1.19.1
+  file_selector: ^1.0.3
+  flutter:
+    sdk: flutter
+  flutter_inappwebview: ^6.1.5
+  flutter_riverpod: ^2.6.1
+  intl: ^0.20.2
+  path: ^1.9.1
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/cornerstone_viewer/
+    - assets/cornerstone_viewer/assets/
