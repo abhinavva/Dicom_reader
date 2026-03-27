@@ -4,6 +4,7 @@ class DicomWebEndpoint {
     required this.name,
     required this.qidoRoot,
     required this.wadoUriRoot,
+    this.useWadoRs = false,
     this.maxStudies = 20,
     this.maxSeriesPerStudy = 24,
     this.maxInstancesPerSeries = 700,
@@ -13,6 +14,7 @@ class DicomWebEndpoint {
   final String name;
   final String qidoRoot;
   final String wadoUriRoot;
+  final bool useWadoRs;
   final int maxStudies;
   final int maxSeriesPerStudy;
   final int maxInstancesPerSeries;

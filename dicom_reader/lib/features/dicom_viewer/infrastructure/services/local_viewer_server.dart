@@ -4,8 +4,10 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 
+import '../../../../core/services/app_logger.dart';
 import '../../application/models/viewer_study_session.dart';
 import '../../domain/entities/dicom_models.dart';
+import '../../domain/services/viewer_server.dart';
 
 const String _viewerAssetPrefix = 'assets/cornerstone_viewer';
 const String _viewerPathPrefix = '/viewer';
@@ -44,21 +46,25 @@ ContentType getContentTypeForPath(String path) {
 ///
 /// - `/viewer/*` -> bundled web assets from Flutter assets.
 /// - `/dicom/<token>` -> streamed local or proxied remote DICOM bytes.
-class LocalViewerServer {
+class LocalViewerServer implements ViewerServer {
   HttpServer? _server;
   int _tokenSeed = 0;
   final Map<String, _DicomObjectSource> _tokenToSource =
       <String, _DicomObjectSource>{};
   final Map<String, Uint8List> _assetCache = <String, Uint8List>{};
+  final AppLogger _log = AppLogger.instance;
+  static const String _tag = 'ViewerServer';
 
   Future<void> ensureStarted() async {
     if (_server != null) {
       return;
     }
     _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    _log.info(_tag, 'Server started on port ${_server!.port}');
     unawaited(_server!.forEach(_handleRequest));
   }
 
+  @override
   Future<ViewerStudySession> registerBundle(DicomStudyBundle bundle) async {
     await ensureStarted();
 
@@ -88,8 +94,8 @@ class LocalViewerServer {
             imageIds.add(
               'wadouri:${_rootUri.resolve('$_dicomPathPrefix/$token')}',
             );
-          } catch (_) {
-            // Skip problematic instances so the series can still load.
+          } catch (e, st) {
+            _log.warn(_tag, 'Skipped problematic instance at index $i', e, st);
           }
         }
 
@@ -298,17 +304,20 @@ class LocalViewerServer {
 
     try {
       final upstreamRequest = await client.getUrl(remoteUri);
-      upstreamRequest.headers.set(
-        HttpHeaders.acceptHeader,
-        'application/dicom',
-      );
       for (final header in source.remoteHeaders.entries) {
         upstreamRequest.headers.set(header.key, header.value);
+      }
+      if (!source.remoteHeaders.containsKey('Accept')) {
+        upstreamRequest.headers.set(
+          HttpHeaders.acceptHeader,
+          'application/dicom',
+        );
       }
 
       final upstreamResponse = await upstreamRequest.close();
       if (upstreamResponse.statusCode < 200 ||
           upstreamResponse.statusCode >= 300) {
+        _log.warn(_tag, 'Remote WADO failed (${upstreamResponse.statusCode}) for $remoteUri');
         request.response
           ..statusCode = HttpStatus.badGateway
           ..headers.contentType = ContentType.text;
@@ -320,15 +329,45 @@ class LocalViewerServer {
         return;
       }
 
-      request.response
-        ..statusCode = HttpStatus.ok
-        ..headers.contentType = ContentType('application', 'dicom')
-        ..headers.set(HttpHeaders.accessControlAllowOriginHeader, '*');
-      _applyNoCacheHeaders(request.response);
+      // Check if the response is multipart (WADO-RS)
+      final contentType = upstreamResponse.headers.contentType;
+      final isMultipart = contentType?.primaryType == 'multipart';
 
-      await request.response.addStream(upstreamResponse);
-      await request.response.close();
-    } catch (_) {
+      if (isMultipart) {
+        // For multipart/related responses, collect all bytes and extract
+        // the first DICOM part.
+        final bodyBytes = await upstreamResponse.fold<List<int>>(
+          <int>[],
+          (previous, element) {
+            previous.addAll(element);
+            return previous;
+          },
+        );
+
+        final dicomBytes = _extractDicomFromMultipart(
+          bodyBytes,
+          contentType.toString(),
+        );
+
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType('application', 'dicom')
+          ..headers.set(HttpHeaders.accessControlAllowOriginHeader, '*');
+        _applyNoCacheHeaders(request.response);
+        request.response.add(dicomBytes);
+        await request.response.close();
+      } else {
+        // Single-part response — stream through directly.
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType('application', 'dicom')
+          ..headers.set(HttpHeaders.accessControlAllowOriginHeader, '*');
+        _applyNoCacheHeaders(request.response);
+        await request.response.addStream(upstreamResponse);
+        await request.response.close();
+      }
+    } catch (e, st) {
+      _log.error(_tag, 'Remote DICOM fetch error for ${source.remoteUri}', e, st);
       request.response
         ..statusCode = HttpStatus.badGateway
         ..headers.contentType = ContentType.text;
@@ -338,6 +377,77 @@ class LocalViewerServer {
     } finally {
       client.close(force: true);
     }
+  }
+
+  /// Extracts the first DICOM part from a multipart/related response body.
+  List<int> _extractDicomFromMultipart(
+    List<int> bodyBytes,
+    String contentTypeHeader,
+  ) {
+    // Parse the boundary from Content-Type
+    final boundaryMatch = RegExp(
+      r'boundary="?([^";,\s]+)"?',
+      caseSensitive: false,
+    ).firstMatch(contentTypeHeader);
+    if (boundaryMatch == null) {
+      // No boundary found — return entire body as-is (best effort)
+      return bodyBytes;
+    }
+    final boundary = '--${boundaryMatch.group(1)!}';
+    final boundaryBytes = utf8.encode(boundary);
+
+    // Find the first part between the first two boundary markers
+    final bodyString = bodyBytes;
+    int firstBoundaryEnd = _indexOfBytes(bodyString, boundaryBytes, 0);
+    if (firstBoundaryEnd < 0) {
+      return bodyBytes;
+    }
+    // Skip past the boundary and the CRLF after it
+    firstBoundaryEnd += boundaryBytes.length;
+    while (firstBoundaryEnd < bodyString.length &&
+        (bodyString[firstBoundaryEnd] == 0x0D ||
+            bodyString[firstBoundaryEnd] == 0x0A)) {
+      firstBoundaryEnd++;
+    }
+
+    // Find the end of the part (next boundary)
+    int secondBoundary = _indexOfBytes(bodyString, boundaryBytes, firstBoundaryEnd);
+    if (secondBoundary < 0) {
+      secondBoundary = bodyString.length;
+    }
+
+    // The part contains headers then \r\n\r\n then body
+    final partBytes = bodyString.sublist(firstBoundaryEnd, secondBoundary);
+    final headerEndIndex = _indexOfBytes(partBytes, [0x0D, 0x0A, 0x0D, 0x0A], 0);
+    if (headerEndIndex < 0) {
+      // No header separator found — could be just the body
+      return partBytes;
+    }
+
+    // Strip trailing CRLF before the next boundary
+    int end = partBytes.length;
+    while (end > headerEndIndex + 4 &&
+        (partBytes[end - 1] == 0x0D || partBytes[end - 1] == 0x0A)) {
+      end--;
+    }
+
+    return partBytes.sublist(headerEndIndex + 4, end);
+  }
+
+  int _indexOfBytes(List<int> haystack, List<int> needle, int start) {
+    for (var i = start; i <= haystack.length - needle.length; i++) {
+      var found = true;
+      for (var j = 0; j < needle.length; j++) {
+        if (haystack[i + j] != needle[j]) {
+          found = false;
+          break;
+        }
+      }
+      if (found) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   Future<void> _replyNotFound(HttpRequest request) async {
@@ -353,6 +463,7 @@ class LocalViewerServer {
     Object error,
     StackTrace stackTrace,
   ) async {
+    _log.error(_tag, 'Internal server error on ${request.uri.path}', error, stackTrace);
     request.response
       ..statusCode = HttpStatus.internalServerError
       ..headers.contentType = ContentType.text;

@@ -1,4 +1,3 @@
-import 'package:file_selector/file_selector.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../domain/repositories/dicom_web_repository.dart';
@@ -13,6 +12,7 @@ import '../../infrastructure/repositories/local_dicom_study_repository.dart';
 import '../../infrastructure/repositories/public_dicom_web_repository.dart';
 import '../../infrastructure/services/dicom_parser_service.dart';
 import '../../infrastructure/services/local_viewer_server.dart';
+import '../../infrastructure/services/system_directory_picker.dart';
 import '../dicom_viewer_controller.dart';
 import '../dicom_viewer_state.dart';
 
@@ -73,21 +73,3 @@ final dicomViewerControllerProvider =
         viewerServer: ref.watch(localViewerServerProvider),
       );
     });
-
-class SystemStudyDirectoryPicker implements StudyDirectoryPicker {
-  const SystemStudyDirectoryPicker();
-
-  @override
-  Future<String?> pickStudyDirectory() {
-    return getDirectoryPath(confirmButtonText: 'Load Folder');
-  }
-
-  @override
-  Future<List<String>> pickDicomFiles() async {
-    final files = await openFiles(confirmButtonText: 'Open DICOM Files');
-    return files
-        .map((file) => file.path)
-        .where((path) => path.isNotEmpty)
-        .toList();
-  }
-}

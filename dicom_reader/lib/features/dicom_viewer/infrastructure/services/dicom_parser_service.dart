@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import '../../../../core/services/app_logger.dart';
 import '../../domain/entities/dicom_models.dart';
 
 class ParsedDicomFile {
@@ -32,6 +33,8 @@ class DicomParserService {
   const DicomParserService();
 
   static const int _maxHeaderBytes = 1024 * 1024;
+  static final AppLogger _log = AppLogger.instance;
+  static const String _tag = 'DicomParser';
 
   Future<ParsedDicomFile?> parseFile(String filePath) async {
     try {
@@ -90,7 +93,7 @@ class DicomParserService {
         await raf.close();
       }
     } catch (e) {
-      // Malformed, truncated, or unreadable file – skip it.
+      _log.warn(_tag, 'Failed to parse DICOM file: $filePath', e);
       return null;
     }
   }
@@ -266,8 +269,8 @@ class _DicomBufferParser {
             return _data.length;
           }
         }
-      } catch (_) {
-        // Corrupted element – stop parsing, return what we have so far.
+      } catch (e) {
+        AppLogger.instance.debug('DicomParser', 'Corrupted element at offset $offset — stopping parse');
         return _data.length;
       }
     }

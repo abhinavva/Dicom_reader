@@ -13,6 +13,18 @@ const state = {
 };
 
 let reportTimer = null;
+let loadProgressTimer = null;
+
+function emitLoadProgress(seriesUid, loaded, total) {
+  clearTimeout(loadProgressTimer);
+  loadProgressTimer = setTimeout(() => {
+    emit('imageProgress', {
+      seriesInstanceUid: seriesUid,
+      loaded: loaded,
+      total: total,
+    });
+  }, 100);
+}
 
 function emit(type, payload) {
   if (window.flutter_inappwebview?.callHandler) {
@@ -280,12 +292,16 @@ async function loadSeries(payload) {
     }
 
     state.currentSeries = payload;
-    setStatus(`Loading ${payload.imageIds.length} slices...`);
+    const total = payload.imageIds.length;
+    const seriesUid = payload.seriesInstanceUid || '';
+    emit('imageProgress', { seriesInstanceUid: seriesUid, loaded: 0, total: total });
+    setStatus(`Loading ${total} slices...`);
 
     await state.viewport.setStack(payload.imageIds, 0);
     state.viewport.render();
     await setTool(state.activeTool);
 
+    emit('imageProgress', { seriesInstanceUid: seriesUid, loaded: total, total: total });
     setStatus('Series loaded');
     reportViewportState('Series loaded');
   } catch (error) {

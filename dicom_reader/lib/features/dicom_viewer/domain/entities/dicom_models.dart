@@ -56,6 +56,38 @@ class DicomSeries {
   final List<DicomInstance> instances;
 
   DicomInstance get leadInstance => instances.first;
+
+  /// Whether this series contains displayable pixel data.
+  bool get isImageModality => !nonImageModalities.contains(modality.toUpperCase());
+
+  /// DICOM modalities that do NOT contain renderable pixel data.
+  static const Set<String> nonImageModalities = <String>{
+    'SR',       // Structured Report
+    'PR',       // Presentation State
+    'KO',       // Key Object Selection
+    'AU',       // Audio
+    'RTSTRUCT', // RT Structure Set
+    'RTPLAN',   // RT Plan
+    'RTDOSE',   // RT Dose
+    'RTRECORD', // RT Treatment Record
+    'RTIMAGE',  // RT Image (sometimes viewable, but rarely standard stacks)
+    'SEG',      // Segmentation
+    'REG',      // Registration
+    'FID',      // Fiducials
+    'RWV',      // Real World Value Mapping
+    'PLAN',     // Plan
+    'DOC',      // Document
+    'SMR',      // Stereometric Relationship
+    'AR',       // Archive (non-standard)
+    'ECG',      // Electrocardiography
+    'HD',       // Hemodynamic
+    'IOL',      // Intraocular Lens Data
+    'RESP',     // Respiratory
+    'STAIN',    // Slide Microscopy Stain
+    'OPR',      // Ophthalmic Refraction
+    'LEN',      // Lensometry
+    'SRF',      // Subjective Refraction (non-standard alias)
+  };
 }
 
 class DicomStudy {

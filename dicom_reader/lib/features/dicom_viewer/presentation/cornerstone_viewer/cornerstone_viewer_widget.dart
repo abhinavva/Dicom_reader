@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
+import '../../../../core/services/app_logger.dart';
 import '../../application/models/viewer_study_session.dart';
 import '../../domain/entities/viewer_models.dart';
 
@@ -15,6 +16,7 @@ class CornerstoneViewerWidget extends StatefulWidget {
     required this.onStatusChanged,
     this.onFatalError,
     this.onSeriesThumbnailGenerated,
+    this.onImageProgress,
   });
 
   final String viewerUrl;
@@ -23,6 +25,8 @@ class CornerstoneViewerWidget extends StatefulWidget {
   final ValueChanged<String>? onFatalError;
   final void Function(String seriesInstanceUid, String dataUrl)?
   onSeriesThumbnailGenerated;
+  final void Function(String seriesInstanceUid, int loaded, int total)?
+  onImageProgress;
 
   @override
   State<CornerstoneViewerWidget> createState() =>
@@ -42,6 +46,8 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
   bool _recoveringFromLoadError = false;
   int _loadRecoveryAttempts = 0;
   Timer? _bootTimer;
+  final AppLogger _log = AppLogger.instance;
+  static const String _tag = 'CornerstoneViewer';
 
   static const Duration _bootTimeout = Duration(seconds: 15);
   static const int _maxLoadRecoveryAttempts = 128;
@@ -88,6 +94,37 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
 
     await _evaluate(
       'window.cornerstoneViewer && window.cornerstoneViewer.resetViewport();',
+    );
+  }
+
+  Future<void> clearAnnotations() async {
+    if (!_viewerReady) {
+      return;
+    }
+
+    await _evaluate(
+      'window.cornerstoneViewer && window.cornerstoneViewer.clearAnnotations();',
+    );
+  }
+
+  Future<void> enableMpr(MprOrientation orientation) async {
+    if (!_viewerReady) return;
+    await _evaluate(
+      "window.cornerstoneViewer && window.cornerstoneViewer.enableMpr('${orientation.name}');",
+    );
+  }
+
+  Future<void> disableMpr() async {
+    if (!_viewerReady) return;
+    await _evaluate(
+      'window.cornerstoneViewer && window.cornerstoneViewer.disableMpr();',
+    );
+  }
+
+  Future<void> setMprOrientation(MprOrientation orientation) async {
+    if (!_viewerReady) return;
+    await _evaluate(
+      "window.cornerstoneViewer && window.cornerstoneViewer.setMprOrientation('${orientation.name}');",
     );
   }
 
@@ -138,7 +175,7 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
     try {
       await controller.evaluateJavascript(source: source);
     } catch (error, stackTrace) {
-      debugPrint('Viewer evaluateJavascript error: $error\n$stackTrace');
+      _log.error(_tag, 'evaluateJavascript error', error, stackTrace);
       if (!mounted) {
         return;
       }
@@ -218,6 +255,7 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
 
     _recoveringFromLoadError = true;
     _loadRecoveryAttempts += 1;
+    _log.info(_tag, 'Load recovery attempt $_loadRecoveryAttempts — ${_activeImageIds.length} slices left');
 
     widget.onStatusChanged(
       'Skipped unreadable slice and retrying (${_activeImageIds.length} slices left)...',
@@ -239,6 +277,7 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
         return;
       }
 
+      _log.warn(_tag, 'Boot timeout after ${_bootTimeout.inSeconds}s');
       widget.onStatusChanged('Viewer startup timed out');
       _reportFatal(
         'Viewer startup timed out. Please reopen the study or restart the app.',
@@ -281,6 +320,7 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
       case 'ready':
         _viewerReady = true;
         _bootTimer?.cancel();
+        _log.info(_tag, 'Cornerstone viewer ready');
         widget.onStatusChanged('Cornerstone ready');
         unawaited(_flushPendingActions());
         return;
@@ -331,13 +371,65 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
         widget.onStatusChanged('Skipped unreadable slice in series');
         return;
 
+      case 'imageProgress':
+        if (payload is! Map) {
+          return;
+        }
+
+        final raw = Map<String, dynamic>.from(payload);
+        final seriesUid = raw['seriesInstanceUid'] as String?;
+        final loaded = (raw['loaded'] as num?)?.toInt() ?? 0;
+        final total = (raw['total'] as num?)?.toInt() ?? 0;
+
+        if (seriesUid != null && seriesUid.isNotEmpty && total > 0) {
+          widget.onImageProgress?.call(seriesUid, loaded, total);
+        }
+        return;
+
+      case 'mprMode':
+        if (payload is Map) {
+          final raw = Map<String, dynamic>.from(payload);
+          final enabled = raw['enabled'] as bool? ?? false;
+          final orientationStr = raw['orientation'] as String?;
+          MprOrientation? orientation;
+          if (orientationStr != null) {
+            orientation = MprOrientation.values.where(
+              (e) => e.name == orientationStr,
+            ).firstOrNull;
+          }
+          widget.onViewportChanged(
+            ViewportOverlayState(
+              mprEnabled: enabled,
+              mprOrientation: orientation,
+              statusMessage: enabled
+                  ? 'MPR: ${orientationStr ?? 'axial'}'
+                  : 'Stack mode',
+            ),
+          );
+        }
+        return;
+
       case 'error':
         final message = payload is String ? payload : 'Viewer error';
+        _log.error(_tag, 'Viewer error event: $message');
         if (_attemptRecoverFromLoadError(message)) {
           return;
         }
+        // Non-fatal transient errors (WebGL recovery, texture issues)
+        // should update the status but NOT navigate away from the viewer.
+        final lower = message.toLowerCase();
+        final isTransient = lower.contains('webgl') ||
+            lower.contains('texture') ||
+            lower.contains('context') ||
+            lower.contains('recovery') ||
+            lower.contains('renderview') ||
+            lower.contains('thumbnail') ||
+            lower.contains('null') ||
+            lower.contains('mpr');
         widget.onStatusChanged(message);
-        _reportFatal(message);
+        if (!isTransient) {
+          _reportFatal(message);
+        }
         return;
 
       default:
@@ -382,7 +474,10 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
             ),
             onWebViewCreated: (controller) {
               _webViewController = controller;
-              unawaited(InAppWebViewController.clearAllCache());
+              // clearAllCache is not implemented on Windows — ignore the error.
+              try {
+                InAppWebViewController.clearAllCache().ignore();
+              } catch (_) {}
 
               controller.addJavaScriptHandler(
                 handlerName: 'viewerEvent',
@@ -394,9 +489,7 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
                   try {
                     _handleViewerEvent(args);
                   } catch (error, stackTrace) {
-                    debugPrint(
-                      'Viewer event callback error: $error\n$stackTrace',
-                    );
+                    _log.error(_tag, 'Viewer event callback error', error, stackTrace);
                     if (!mounted) {
                       return;
                     }
@@ -414,11 +507,21 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
                 return;
               }
 
-              debugPrint('Viewer console: ${message.messageLevel} $text');
+              _log.debug(_tag, 'Console [${message.messageLevel}]: $text');
 
-              final lower = text.toLowerCase();
-              if (lower.contains('error') || lower.contains('failed')) {
-                widget.onStatusChanged(text);
+              // Only surface genuine errors to the user — skip
+              // routine cache/thumbnail warnings from Cornerstone.
+              if (message.messageLevel == ConsoleMessageLevel.ERROR) {
+                final lower = text.toLowerCase();
+                final isRoutineWarning =
+                    lower.contains('error caching image') ||
+                    lower.contains('thumbnail generation failed') ||
+                    lower.contains('texture') ||
+                    lower.contains('oes_texture_float_linear') ||
+                    lower.contains('webgl');
+                if (!isRoutineWarning) {
+                  widget.onStatusChanged(text);
+                }
               }
             },
             onLoadStart: (controller, uri) {
@@ -447,6 +550,7 @@ class CornerstoneViewerWidgetState extends State<CornerstoneViewerWidget> {
             },
             onReceivedError: (controller, request, error) {
               final message = 'Could not load viewer: ${error.description}';
+              _log.error(_tag, 'WebView load error: ${error.description}');
               widget.onStatusChanged(message);
               _reportFatal(message);
             },

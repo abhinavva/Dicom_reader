@@ -1,18 +1,54 @@
-﻿import * as cornerstone from '@cornerstonejs/core';
+﻿/**
+ * viewer.js — Core viewer orchestrator.
+ *
+ * Wires together Cornerstone3D initialization, series loading, tool
+ * management, and event listeners.  Domain logic lives in dedicated
+ * modules:
+ *
+ *   bridge.js       — Flutter ↔ JS communication
+ *   imageIds.js     — Image ID normalization / validation
+ *   viewportState.js— Viewport state extraction & reporting
+ *   loadProgress.js — Series image load progress tracking
+ *   cine.js         — Cine loop playback
+ *   thumbnails.js   — Offscreen thumbnail generation
+ *   tools.js        — Cornerstone tool registration
+ */
+
+import * as cornerstone from '@cornerstonejs/core';
 import * as cornerstoneTools from '@cornerstonejs/tools';
 import cornerstoneDICOMImageLoader from '@cornerstonejs/dicom-image-loader';
 import * as dicomParser from 'dicom-parser';
 
-import { registerStackTools, activatePrimaryTool } from './tools.js';
+import { emit, bindStatusPill, setStatus } from './bridge.js';
+import { normalizeImageIds } from './imageIds.js';
+import {
+  reportViewportState,
+  scheduleViewportReport,
+} from './viewportState.js';
+import { resetProgress, recordImage } from './loadProgress.js';
+import {
+  startCine as startCineLoop,
+  stopCine as stopCineLoop,
+  setCineSpeed as setCineLoopSpeed,
+  isCinePlaying,
+} from './cine.js';
+import { generateSeriesThumbnails } from './thumbnails.js';
+import { registerStackTools, activatePrimaryTool, clearAnnotations } from './tools.js';
+
+/* ------------------------------------------------------------------ */
+/*  Constants                                                          */
+/* ------------------------------------------------------------------ */
 
 const RENDERING_ENGINE_ID = 'dicom-rendering-engine';
 const VIEWPORT_ID = 'dicom-stack-viewport';
 const CACHE_SIZE_BYTES = 2 * 1024 * 1024 * 1024;
-const REPORT_DEBOUNCE_MS = 60;
-const MAX_STACK_SIZE = 3000;
+
+/* ------------------------------------------------------------------ */
+/*  Module-level state                                                 */
+/* ------------------------------------------------------------------ */
 
 let viewerElement = null;
-let statusPill = null;
+let viewportContainer = null;
 let sliceOverlayElement = null;
 let renderingEngine = null;
 let viewport = null;
@@ -22,202 +58,34 @@ let initialized = false;
 let initializePromise = null;
 let activeTool = 'windowLevel';
 let currentSeries = null;
-let reportTimer = null;
+let mprActive = false;
+let currentVolumeId = null;
 
-let cineTimer = null;
-let cinePlaying = false;
-let cineFps = 15;
-let cineDirection = 1;
+/** MPR viewport elements and IDs (used only in MPR mode). */
+let mprViewportElements = [];
+const MPR_VIEWPORT_IDS = ['mpr-axial', 'mpr-sagittal', 'mpr-coronal'];
+
+const VOLUME_ID_PREFIX = 'cornerstoneStreamingImageVolume:';
 
 const stackContextPrefetch = cornerstoneTools.utilities?.stackContextPrefetch;
 
-function emit(type, payload) {
-  if (window.flutter_inappwebview?.callHandler) {
-    window.flutter_inappwebview.callHandler('viewerEvent', { type, payload });
-  }
-}
-
-function setStatus(message) {
-  if (statusPill) {
-    statusPill.textContent = message;
-  }
-  emit('status', message);
-}
-
-function normalizeImageId(imageId) {
-  if (typeof imageId !== 'string') {
-    return '';
-  }
-
-  // Compatibility with old builds that emitted wado-uri: instead of wadouri:
-  if (imageId.startsWith('wado-uri:')) {
-    return `wadouri:${imageId.substring('wado-uri:'.length)}`;
-  }
-
-  return imageId;
-}
-
-function normalizeImageIds(imageIds) {
-  if (!Array.isArray(imageIds)) {
-    throw new Error('imageIds must be an array');
-  }
-
-  const normalized = imageIds
-    .map(normalizeImageId)
-    .filter((id) => typeof id === 'string' && id.length > 0);
-
-  if (normalized.length === 0) {
-    throw new Error('No valid image IDs found in selected series');
-  }
-
-  if (normalized.length > MAX_STACK_SIZE) {
-    return normalized.slice(0, MAX_STACK_SIZE);
-  }
-
-  return normalized;
-}
-
-function extractWindowLevel(properties) {
-  const voiRange = properties?.voiRange;
-  if (!voiRange) {
-    return { windowWidth: null, windowCenter: null };
-  }
-
-  const upper = voiRange.upper ?? null;
-  const lower = voiRange.lower ?? null;
-  if (upper == null || lower == null) {
-    return { windowWidth: null, windowCenter: null };
-  }
-
-  return {
-    windowWidth: Math.abs(upper - lower),
-    windowCenter: (upper + lower) / 2,
-  };
-}
-
-function buildViewportState(statusMessage = null) {
-  if (!viewport) {
-    return null;
-  }
-
-  const properties = viewport.getProperties?.() ?? {};
-  const { windowWidth, windowCenter } = extractWindowLevel(properties);
-  const zoom = typeof viewport.getZoom === 'function' ? viewport.getZoom() : 1;
-  const currentImageIndex =
-    typeof viewport.getCurrentImageIdIndex === 'function'
-      ? viewport.getCurrentImageIdIndex()
-      : 0;
-  const totalImages = currentSeries?.imageIds?.length ?? 0;
-
-  return {
-    zoom: Number.isFinite(zoom) ? zoom : 1,
-    windowWidth,
-    windowCenter,
-    currentImageIndex,
-    totalImages,
-    isReady: true,
-    statusMessage,
-  };
-}
-
-function setSliceOverlay(currentImageIndex, totalImages) {
-  if (!sliceOverlayElement) {
-    return;
-  }
-
-  if (!Number.isFinite(totalImages) || totalImages <= 0) {
-    sliceOverlayElement.textContent = '';
-    sliceOverlayElement.style.display = 'none';
-    return;
-  }
-
-  const safeCurrent = Math.max(0, Math.min(currentImageIndex, totalImages - 1));
-  sliceOverlayElement.style.display = 'block';
-  sliceOverlayElement.textContent = `Slice: ${safeCurrent + 1} / ${totalImages}`;
-}
-
-function reportViewportState(statusMessage = null) {
-  const state = buildViewportState(statusMessage);
-  if (!state) {
-    return;
-  }
-
-  setSliceOverlay(state.currentImageIndex, state.totalImages);
-  emit('viewport', state);
-}
-
-function scheduleViewportReport(statusMessage = null) {
-  clearTimeout(reportTimer);
-  reportTimer = setTimeout(() => {
-    reportViewportState(statusMessage);
-  }, REPORT_DEBOUNCE_MS);
-}
+/* ------------------------------------------------------------------ */
+/*  Prefetch helpers                                                   */
+/* ------------------------------------------------------------------ */
 
 function enablePrefetch() {
-  if (!stackContextPrefetch || !viewerElement) {
-    return;
-  }
-
-  try {
-    stackContextPrefetch.enable(viewerElement, 0);
-  } catch (_) {
-    // Best effort.
-  }
+  if (!stackContextPrefetch || !viewerElement) return;
+  try { stackContextPrefetch.enable(viewerElement, 0); } catch (_) { /* best effort */ }
 }
 
 function disablePrefetch() {
-  if (!stackContextPrefetch || !viewerElement) {
-    return;
-  }
-
-  try {
-    stackContextPrefetch.disable(viewerElement);
-  } catch (_) {
-    // Best effort.
-  }
+  if (!stackContextPrefetch || !viewerElement) return;
+  try { stackContextPrefetch.disable(viewerElement); } catch (_) { /* best effort */ }
 }
 
-function registerListeners() {
-  if (!viewerElement) {
-    return;
-  }
-
-  const interactionEvents = ['wheel', 'mouseup', 'mouseleave', 'touchend', 'dblclick'];
-  for (const eventName of interactionEvents) {
-    viewerElement.addEventListener(eventName, () => scheduleViewportReport());
-  }
-
-  window.addEventListener('resize', () => {
-    try {
-      renderingEngine?.resize(true, false);
-    } catch (_) {
-      // Best effort.
-    }
-    scheduleViewportReport();
-  });
-
-  if (cornerstone.eventTarget?.addEventListener) {
-    cornerstone.eventTarget.addEventListener(cornerstone.EVENTS.IMAGE_RENDERED, () => {
-      scheduleViewportReport();
-    });
-
-    cornerstone.eventTarget.addEventListener(cornerstone.EVENTS.IMAGE_LOAD_FAILED, (event) => {
-      const imageId = event?.detail?.imageId ?? 'unknown';
-      const reason = event?.detail?.error?.message ?? event?.detail?.errorMessage ?? '';
-      emit('imageLoadFailed', {
-        imageId,
-        reason,
-      });
-      scheduleViewportReport();
-    });
-  }
-
-  viewerElement.addEventListener('webglcontextlost', (event) => {
-    event.preventDefault();
-    setStatus('WebGL context lost');
-    emit('error', 'WebGL context lost. Please reload the study.');
-  });
-}
+/* ------------------------------------------------------------------ */
+/*  DICOM image loader configuration                                   */
+/* ------------------------------------------------------------------ */
 
 function configureDicomImageLoader() {
   if (cornerstoneDICOMImageLoader?.external) {
@@ -231,75 +99,132 @@ function configureDicomImageLoader() {
   });
 }
 
+/* ------------------------------------------------------------------ */
+/*  Tool application                                                   */
+/* ------------------------------------------------------------------ */
+
 function applyTool(toolId) {
-  if (!toolGroup || !toolNames) {
-    return;
-  }
+  if (!toolGroup || !toolNames) return;
 
   if (toolId === 'crosshair') {
-    if (viewerElement) {
-      viewerElement.classList.add('crosshair-mode');
-    }
+    viewerElement?.classList.add('crosshair-mode');
     setStatus('Tool: crosshair');
-    scheduleViewportReport('Tool: crosshair');
+    scheduleViewportReport(viewport, currentSeries, sliceOverlayElement, 'Tool: crosshair');
     return;
   }
 
-  if (viewerElement) {
-    viewerElement.classList.remove('crosshair-mode');
-  }
-
+  viewerElement?.classList.remove('crosshair-mode');
   activatePrimaryTool(toolGroup, toolNames, toolId);
   setStatus(`Tool: ${toolId}`);
-  scheduleViewportReport(`Tool: ${toolId}`);
+  scheduleViewportReport(viewport, currentSeries, sliceOverlayElement, `Tool: ${toolId}`);
 }
 
-function clearCineTimer() {
-  if (cineTimer != null) {
-    clearTimeout(cineTimer);
-    cineTimer = null;
+/* ------------------------------------------------------------------ */
+/*  Event listeners                                                    */
+/* ------------------------------------------------------------------ */
+
+function registerListeners() {
+  if (!viewerElement) return;
+
+  const interactionEvents = ['wheel', 'mouseup', 'mouseleave', 'touchend', 'dblclick'];
+  for (const eventName of interactionEvents) {
+    viewerElement.addEventListener(eventName, () =>
+      scheduleViewportReport(viewport, currentSeries, sliceOverlayElement),
+    );
   }
+
+  window.addEventListener('resize', () => {
+    try { renderingEngine?.resize(true, false); } catch (_) { /* best effort */ }
+    scheduleViewportReport(viewport, currentSeries, sliceOverlayElement);
+  });
+
+  if (cornerstone.eventTarget?.addEventListener) {
+    cornerstone.eventTarget.addEventListener(cornerstone.EVENTS.IMAGE_RENDERED, () => {
+      scheduleViewportReport(viewport, currentSeries, sliceOverlayElement);
+    });
+
+    cornerstone.eventTarget.addEventListener(cornerstone.EVENTS.IMAGE_LOAD_FAILED, (event) => {
+      const imageId = event?.detail?.imageId ?? 'unknown';
+      const reason = event?.detail?.error?.message ?? event?.detail?.errorMessage ?? '';
+      emit('imageLoadFailed', { imageId, reason });
+
+      // Count failed images as "loaded" for progress purposes.
+      recordImage(imageId, currentSeries?.imageIds ?? []);
+      scheduleViewportReport(viewport, currentSeries, sliceOverlayElement);
+    });
+
+    cornerstone.eventTarget.addEventListener(cornerstone.EVENTS.IMAGE_CACHE_IMAGE_ADDED, (event) => {
+      const imageId = event?.detail?.imageId ?? '';
+      recordImage(imageId, currentSeries?.imageIds ?? []);
+    });
+  }
+
+  viewerElement.addEventListener('webglcontextlost', (event) => {
+    event.preventDefault();
+    setStatus('WebGL context lost — recovering…');
+    emit('error', 'WebGL context lost. Attempting recovery…');
+
+    // Attempt to re-create the rendering engine on the same element.
+    setTimeout(async () => {
+      try {
+        renderingEngine?.destroy?.();
+      } catch (_) { /* best effort */ }
+
+      try {
+        renderingEngine = new cornerstone.RenderingEngine(RENDERING_ENGINE_ID);
+        renderingEngine.enableElement({
+          viewportId: VIEWPORT_ID,
+          element: viewerElement,
+          type: cornerstone.Enums.ViewportType.STACK,
+          defaultOptions: { background: [0, 0, 0] },
+        });
+        viewport = renderingEngine.getViewport(VIEWPORT_ID);
+
+        // Re-apply tools to the fresh viewport.
+        const toolReg = registerStackTools(RENDERING_ENGINE_ID, VIEWPORT_ID);
+        toolGroup = toolReg.toolGroup;
+        toolNames = toolReg.toolNames;
+
+        // Re-load the current series if we had one.
+        if (currentSeries?.imageIds?.length) {
+          await viewport.setStack(currentSeries.imageIds, 0);
+          viewport.render();
+          applyTool(activeTool);
+          enablePrefetch();
+        }
+
+        setStatus('WebGL context recovered');
+        reportViewportState(viewport, currentSeries, sliceOverlayElement, 'Context recovered');
+      } catch (err) {
+        setStatus('Recovery failed');
+        emit('error', `WebGL recovery failed: ${err?.message ?? err}`);
+      }
+    }, 500);
+  });
 }
 
-function runCineLoop() {
-  if (!cinePlaying || !viewport || !currentSeries?.imageIds?.length) {
-    return;
-  }
-
-  const total = currentSeries.imageIds.length;
-  const currentIndex = viewport.getCurrentImageIdIndex?.() ?? 0;
-
-  let nextIndex = currentIndex + cineDirection;
-  if (nextIndex >= total) {
-    nextIndex = 0;
-  }
-  if (nextIndex < 0) {
-    nextIndex = total - 1;
-  }
-
-  viewport.setImageIdIndex(nextIndex);
-  viewport.render();
-  scheduleViewportReport();
-
-  cineTimer = setTimeout(runCineLoop, Math.round(1000 / cineFps));
-}
+/* ------------------------------------------------------------------ */
+/*  Image probing                                                      */
+/* ------------------------------------------------------------------ */
 
 async function findFirstRenderableImageIndex(imageIds) {
   for (let index = 0; index < imageIds.length; index += 1) {
-    const imageId = imageIds[index];
     try {
-      await cornerstone.imageLoader.loadAndCacheImage(imageId, {
+      await cornerstone.imageLoader.loadAndCacheImage(imageIds[index], {
         priority: 0,
         requestType: 'prefetch',
       });
       return index;
     } catch (_) {
-      // Continue probing until we find a renderable image.
+      // Continue probing.
     }
   }
-
   return -1;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Public API                                                         */
+/* ------------------------------------------------------------------ */
 
 export async function initializeViewer() {
   if (initialized) {
@@ -313,9 +238,10 @@ export async function initializeViewer() {
   }
 
   initializePromise = (async () => {
+    viewportContainer = document.getElementById('viewport-container');
     viewerElement = document.getElementById('viewport');
-    statusPill = document.getElementById('status-pill');
     sliceOverlayElement = document.getElementById('slice-overlay');
+    bindStatusPill(document.getElementById('status-pill'));
 
     if (!viewerElement) {
       throw new Error('Viewer viewport element was not found');
@@ -323,14 +249,16 @@ export async function initializeViewer() {
 
     setStatus('Initializing Cornerstone...');
 
-    await cornerstone.init();
+    await cornerstone.init({
+      gpuTier: { value: 'medium' },
+      rendering: {
+        preferSizeOverAccuracy: true,
+        useNorm16Texture: true,
+      },
+    });
     cornerstoneTools.init();
 
-    try {
-      cornerstone.cache.setMaxCacheSize(CACHE_SIZE_BYTES);
-    } catch (_) {
-      // Cache tuning is optional.
-    }
+    try { cornerstone.cache.setMaxCacheSize(CACHE_SIZE_BYTES); } catch (_) { /* optional */ }
 
     configureDicomImageLoader();
 
@@ -339,9 +267,7 @@ export async function initializeViewer() {
       viewportId: VIEWPORT_ID,
       element: viewerElement,
       type: cornerstone.Enums.ViewportType.STACK,
-      defaultOptions: {
-        background: [0, 0, 0],
-      },
+      defaultOptions: { background: [0, 0, 0] },
     });
 
     viewport = renderingEngine.getViewport(VIEWPORT_ID);
@@ -354,7 +280,7 @@ export async function initializeViewer() {
 
     initialized = true;
     setStatus('Cornerstone ready');
-    reportViewportState('Viewer ready');
+    reportViewportState(viewport, currentSeries, sliceOverlayElement, 'Viewer ready');
     emit('ready', true);
   })();
 
@@ -374,6 +300,31 @@ export async function loadSeries(payload) {
   try {
     await initializeViewer();
 
+    // Exit MPR mode when switching series
+    if (mprActive) {
+      mprActive = false;
+
+      // Disable the 3 MPR viewports.
+      for (const vpId of MPR_VIEWPORT_IDS) {
+        try { renderingEngine.disableElement(vpId); } catch (_) { }
+      }
+      destroyMprViewportElements();
+      viewportContainer.classList.remove('mpr-active');
+      viewerElement.style.display = '';
+
+      renderingEngine.enableElement({
+        viewportId: VIEWPORT_ID,
+        element: viewerElement,
+        type: cornerstone.Enums.ViewportType.STACK,
+        defaultOptions: { background: [0, 0, 0] },
+      });
+      viewport = renderingEngine.getViewport(VIEWPORT_ID);
+      const toolReg = registerStackTools(RENDERING_ENGINE_ID, VIEWPORT_ID);
+      toolGroup = toolReg.toolGroup;
+      toolNames = toolReg.toolNames;
+      emit('mprMode', { enabled: false });
+    }
+
     if (!viewport) {
       throw new Error('Viewport was not initialized');
     }
@@ -391,35 +342,61 @@ export async function loadSeries(payload) {
             .slice(firstRenderableIndex)
             .concat(imageIds.slice(0, firstRenderableIndex));
 
+    // --- Clean up previous series to free GPU textures & memory ----
+    const previousImageIds = currentSeries?.imageIds;
+    stopCine();
+    disablePrefetch();
+
+    // Clear the viewport stack before purging cache so Cornerstone
+    // releases its texture references first.
+    try {
+      await viewport.setStack([orderedImageIds[0]], 0);
+    } catch (_) { /* best effort */ }
+
+    // Purge cached images from the OLD series to free GPU memory and
+    // avoid stale WebGL textures.
+    if (previousImageIds?.length) {
+      for (const id of previousImageIds) {
+        try { cornerstone.cache.removeImageLoadObject(id); } catch (_) { /* ok */ }
+      }
+    }
+    // ---------------------------------------------------------------
+
     currentSeries = {
       studyInstanceUid: payload?.studyInstanceUid ?? '',
       seriesInstanceUid: payload?.seriesInstanceUid ?? '',
       imageIds: orderedImageIds,
     };
 
-    stopCine();
-    disablePrefetch();
+    // Reset progress tracking for this series.
+    resetProgress(currentSeries.seriesInstanceUid, orderedImageIds.length);
+
     setStatus(`Loading ${orderedImageIds.length} slices...`);
 
     viewport.resetCamera();
 
-    // Load a single image first for smooth first paint, then full stack.
-    await viewport.setStack([orderedImageIds[0]], 0);
-    viewport.render();
+    // Set the full stack and render.
     await viewport.setStack(orderedImageIds, 0);
     viewport.render();
 
     // Reset viewport properties only after a valid csImage exists.
-    if (typeof viewport.getCornerstoneImage === 'function' && viewport.getCornerstoneImage()) {
-      viewport.resetProperties?.();
-      viewport.render();
+    try {
+      const csImage = typeof viewport.getCornerstoneImage === 'function'
+        ? viewport.getCornerstoneImage()
+        : null;
+      if (csImage) {
+        viewport.resetProperties?.();
+        viewport.render();
+      }
+    } catch (_) {
+      // Some images do not expose properties safely — continue.
     }
 
     enablePrefetch();
     applyTool(activeTool);
 
     setStatus('Series loaded');
-    reportViewportState('Series loaded');
+    reportViewportState(viewport, currentSeries, sliceOverlayElement, 'Series loaded');
   } catch (error) {
     const message = error?.message ?? String(error);
     setStatus('Failed to load series');
@@ -433,18 +410,21 @@ export async function setTool(toolId) {
 }
 
 export async function resetViewport() {
-  if (!viewport) {
-    return;
-  }
+  if (!viewport) return;
 
   try {
     viewport.resetCamera();
-    if (typeof viewport.getCornerstoneImage === 'function' && viewport.getCornerstoneImage()) {
-      viewport.resetProperties?.();
-    }
+    try {
+      const csImage = typeof viewport.getCornerstoneImage === 'function'
+        ? viewport.getCornerstoneImage()
+        : null;
+      if (csImage) {
+        viewport.resetProperties?.();
+      }
+    } catch (_) { /* best effort */ }
     viewport.render();
     setStatus('Viewport reset');
-    reportViewportState('Viewport reset');
+    reportViewportState(viewport, currentSeries, sliceOverlayElement, 'Viewport reset');
   } catch (error) {
     const message = error?.message ?? String(error);
     setStatus('Reset failed');
@@ -452,126 +432,221 @@ export async function resetViewport() {
   }
 }
 
-async function _createSeriesThumbnail(imageId, seriesInstanceUid) {
-  const normalizedImageId = normalizeImageId(imageId);
-  if (!normalizedImageId) {
-    return null;
-  }
+export { generateSeriesThumbnails } from './thumbnails.js';
+export { isCinePlaying } from './cine.js';
+export { clearAnnotations } from './tools.js';
 
-  const host = document.createElement('div');
-  host.style.cssText = [
-    'position: fixed',
-    'left: -10000px',
-    'top: -10000px',
-    'width: 128px',
-    'height: 128px',
-    'opacity: 0',
-    'pointer-events: none',
-  ].join(';');
-  document.body.appendChild(host);
-
-  const thumbEngineId = `thumb-engine-${seriesInstanceUid}-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-  const thumbViewportId = `thumb-viewport-${seriesInstanceUid}-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-
-  let thumbEngine = null;
-
-  try {
-    thumbEngine = new cornerstone.RenderingEngine(thumbEngineId);
-    thumbEngine.enableElement({
-      viewportId: thumbViewportId,
-      element: host,
-      type: cornerstone.Enums.ViewportType.STACK,
-      defaultOptions: {
-        background: [0, 0, 0],
-      },
-    });
-
-    const thumbViewport = thumbEngine.getViewport(thumbViewportId);
-    await thumbViewport.setStack([normalizedImageId], 0);
-    thumbViewport.render();
-
-    await new Promise((resolve) => {
-      requestAnimationFrame(() => requestAnimationFrame(resolve));
-    });
-
-    const canvas = host.querySelector('canvas');
-    if (!canvas) {
-      return null;
-    }
-
-    return canvas.toDataURL('image/jpeg', 0.72);
-  } catch (error) {
-    console.warn('Thumbnail generation failed for series:', seriesInstanceUid, error);
-    return null;
-  } finally {
-    try {
-      if (thumbEngine) {
-        thumbEngine.disableElement(thumbViewportId);
-        thumbEngine.destroy?.();
-      }
-    } catch (_) {
-      // Best effort cleanup.
-    }
-    host.remove();
-  }
-}
-
-export async function generateSeriesThumbnails(requests = []) {
-  try {
-    await initializeViewer();
-
-    if (!Array.isArray(requests) || requests.length === 0) {
-      return;
-    }
-
-    for (const request of requests) {
-      const seriesInstanceUid = request?.seriesInstanceUid;
-      const imageId = request?.imageId;
-
-      if (!seriesInstanceUid || !imageId) {
-        continue;
-      }
-
-      const dataUrl = await _createSeriesThumbnail(imageId, seriesInstanceUid);
-      if (dataUrl) {
-        emit('thumbnail', {
-          seriesInstanceUid,
-          dataUrl,
-        });
-      }
-    }
-  } catch (error) {
-    const message = error?.message ?? String(error);
-    emit('error', message);
-  }
-}
 export function startCine(framesPerSecond = 15, direction = 1) {
-  if (!viewport || !currentSeries?.imageIds?.length) {
-    return;
-  }
+  if (!viewport || !currentSeries?.imageIds?.length) return;
 
-  cineFps = Math.max(1, Math.min(60, Number(framesPerSecond) || 15));
-  cineDirection = direction >= 0 ? 1 : -1;
-  cinePlaying = true;
-  clearCineTimer();
-  runCineLoop();
+  const fps = Math.max(1, Math.min(60, Number(framesPerSecond) || 15));
+  const dir = direction >= 0 ? 1 : -1;
+  startCineLoop(viewport, currentSeries, sliceOverlayElement, fps);
 }
 
 export function stopCine() {
-  cinePlaying = false;
-  clearCineTimer();
+  stopCineLoop();
 }
 
 export function setCineSpeed(framesPerSecond = 15) {
-  cineFps = Math.max(1, Math.min(60, Number(framesPerSecond) || 15));
+  const fps = Math.max(1, Math.min(60, Number(framesPerSecond) || 15));
+  setCineLoopSpeed(fps, viewport, currentSeries, sliceOverlayElement);
 }
 
-export function isCinePlaying() {
-  return cinePlaying;
+/* ------------------------------------------------------------------ */
+/*  MPR (Multi-Planar Reconstruction)                                  */
+/* ------------------------------------------------------------------ */
+
+function resolveOrientation(orientation) {
+  const map = {
+    axial: cornerstone.Enums.OrientationAxis.AXIAL,
+    sagittal: cornerstone.Enums.OrientationAxis.SAGITTAL,
+    coronal: cornerstone.Enums.OrientationAxis.CORONAL,
+  };
+  return map[orientation] ?? map.axial;
+}
+
+const MPR_ORIENTATIONS = ['axial', 'sagittal', 'coronal'];
+
+/**
+ * Create the 3 MPR viewport elements inside the container.
+ * Returns the array of DOM elements.
+ */
+function createMprViewportElements() {
+  // Remove existing MPR elements if any.
+  destroyMprViewportElements();
+
+  const elements = [];
+  for (let i = 0; i < 3; i++) {
+    const el = document.createElement('div');
+    el.id = MPR_VIEWPORT_IDS[i];
+    el.className = 'viewport';
+    el.style.position = 'relative';
+
+    // Add orientation label.
+    const label = document.createElement('div');
+    label.className = 'mpr-label';
+    label.textContent = MPR_ORIENTATIONS[i].toUpperCase();
+    el.appendChild(label);
+
+    viewportContainer.appendChild(el);
+    elements.push(el);
+  }
+  return elements;
+}
+
+function destroyMprViewportElements() {
+  for (const id of MPR_VIEWPORT_IDS) {
+    const el = document.getElementById(id);
+    if (el) el.remove();
+  }
+  mprViewportElements = [];
+}
+
+export async function enableMpr(orientation = 'axial') {
+  try {
+    await initializeViewer();
+    if (!currentSeries?.imageIds?.length || !renderingEngine) {
+      emit('error', 'No series loaded for MPR');
+      return;
+    }
+
+    stopCine();
+    disablePrefetch();
+
+    const newVolumeId = `${VOLUME_ID_PREFIX}${currentSeries.seriesInstanceUid}`;
+
+    // Remove old volume if switching series.
+    if (currentVolumeId && currentVolumeId !== newVolumeId) {
+      try { cornerstone.cache.removeVolumeLoadObject(currentVolumeId); } catch (_) { }
+    }
+    currentVolumeId = newVolumeId;
+
+    setStatus('Loading MPR…');
+
+    // Hide the stack viewport element.
+    viewerElement.style.display = 'none';
+
+    // Disable the stack viewport to free its WebGL resources.
+    try { renderingEngine.disableElement(VIEWPORT_ID); } catch (_) { }
+
+    // Create 3 MPR viewport elements.
+    viewportContainer.classList.add('mpr-active');
+    mprViewportElements = createMprViewportElements();
+
+    // Enable 3 ORTHOGRAPHIC viewports in the same rendering engine.
+    for (let i = 0; i < 3; i++) {
+      renderingEngine.enableElement({
+        viewportId: MPR_VIEWPORT_IDS[i],
+        element: mprViewportElements[i],
+        type: cornerstone.Enums.ViewportType.ORTHOGRAPHIC,
+        defaultOptions: {
+          orientation: resolveOrientation(MPR_ORIENTATIONS[i]),
+          background: [0, 0, 0],
+        },
+      });
+    }
+
+    // Create (or reuse) the volume.
+    let volume = cornerstone.cache.getVolume(currentVolumeId);
+    if (!volume) {
+      volume = await cornerstone.volumeLoader.createAndCacheVolume(currentVolumeId, {
+        imageIds: currentSeries.imageIds,
+      });
+      volume.load();
+    }
+
+    // Set the shared volume on all 3 viewports.
+    await cornerstone.setVolumesForViewports(
+      renderingEngine,
+      [{ volumeId: currentVolumeId }],
+      MPR_VIEWPORT_IDS,
+    );
+
+    // Re-register tools for all MPR viewports.
+    const toolReg = registerStackTools(RENDERING_ENGINE_ID, MPR_VIEWPORT_IDS);
+    toolGroup = toolReg.toolGroup;
+    toolNames = toolReg.toolNames;
+    applyTool(activeTool);
+
+    // Use the primary viewport (axial) for state reporting.
+    viewport = renderingEngine.getViewport(MPR_VIEWPORT_IDS[0]);
+
+    mprActive = true;
+    setStatus('MPR: axial | sagittal | coronal');
+    emit('mprMode', { enabled: true, orientation: 'axial' });
+    scheduleViewportReport(viewport, currentSeries, sliceOverlayElement, 'MPR active');
+  } catch (error) {
+    setStatus('MPR failed');
+    emit('error', `MPR error: ${error?.message ?? error}`);
+  }
+}
+
+export async function disableMpr() {
+  try {
+    if (!renderingEngine || !mprActive) return;
+
+    mprActive = false;
+    stopCine();
+
+    // Disable the 3 MPR viewports.
+    for (const vpId of MPR_VIEWPORT_IDS) {
+      try { renderingEngine.disableElement(vpId); } catch (_) { }
+    }
+
+    // Remove MPR DOM elements.
+    destroyMprViewportElements();
+    viewportContainer.classList.remove('mpr-active');
+
+    // Show the stack viewport element again.
+    viewerElement.style.display = '';
+
+    // Re-enable the stack viewport.
+    renderingEngine.enableElement({
+      viewportId: VIEWPORT_ID,
+      element: viewerElement,
+      type: cornerstone.Enums.ViewportType.STACK,
+      defaultOptions: { background: [0, 0, 0] },
+    });
+
+    viewport = renderingEngine.getViewport(VIEWPORT_ID);
+
+    // Re-register tools.
+    const toolReg = registerStackTools(RENDERING_ENGINE_ID, VIEWPORT_ID);
+    toolGroup = toolReg.toolGroup;
+    toolNames = toolReg.toolNames;
+
+    // Re-load the series as a stack.
+    if (currentSeries?.imageIds?.length) {
+      await viewport.setStack(currentSeries.imageIds, 0);
+      viewport.render();
+      enablePrefetch();
+    }
+
+    applyTool(activeTool);
+    setStatus('Stack mode');
+    emit('mprMode', { enabled: false });
+    scheduleViewportReport(viewport, currentSeries, sliceOverlayElement, 'Stack mode');
+  } catch (error) {
+    setStatus('Failed to exit MPR');
+    emit('error', `Exit MPR error: ${error?.message ?? error}`);
+  }
+}
+
+export async function setMprOrientation(orientation = 'axial') {
+  if (!mprActive) {
+    return enableMpr(orientation);
+  }
+  // In the new MPR design, all 3 orientations are always visible.
+  // This is a no-op but we emit the event for Flutter state sync.
+  emit('mprMode', { enabled: true, orientation });
+}
+
+export function isMprActive() {
+  return mprActive;
 }
 
 export function isViewerReady() {
   return initialized;
 }
-
 

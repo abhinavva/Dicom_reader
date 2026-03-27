@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../core/services/app_logger.dart';
 import '../../../../core/theme/app_theme.dart';
 import '../../application/dicom_viewer_controller.dart';
 import '../../application/dicom_viewer_state.dart';
+import '../../application/models/viewer_study_session.dart';
 import '../../application/providers/dicom_viewer_providers.dart';
 import '../../domain/entities/viewer_models.dart';
-import '../cornerstone_viewer/cornerstone_viewer_widget.dart';
 import '../widgets/worklist_shell.dart';
 import '../widgets/workstation_shell.dart';
 
@@ -19,11 +20,11 @@ class DicomWorkstationPage extends ConsumerStatefulWidget {
 }
 
 class _DicomWorkstationPageState extends ConsumerState<DicomWorkstationPage> {
-  final GlobalKey<CornerstoneViewerWidgetState> _viewerKey =
-      GlobalKey<CornerstoneViewerWidgetState>();
-  String? _loadedSeriesUid;
+  final GlobalKey<ViewerGridState> _gridKey = GlobalKey<ViewerGridState>();
   ViewerTool? _appliedTool;
   String? _thumbnailRequestSessionKey;
+  final AppLogger _log = AppLogger.instance;
+  static const String _tag = 'WorkstationPage';
 
   @override
   void initState() {
@@ -40,36 +41,17 @@ class _DicomWorkstationPageState extends ConsumerState<DicomWorkstationPage> {
 
     final isViewerScreen = state.screen == WorkstationScreen.viewer;
     if (!isViewerScreen) {
-      _loadedSeriesUid = null;
       _appliedTool = null;
       _thumbnailRequestSessionKey = null;
-    }
-
-    final selectedPayload = state.selectedSeriesPayload;
-
-    if (isViewerScreen &&
-        selectedPayload != null &&
-        selectedPayload.seriesInstanceUid != _loadedSeriesUid) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        try {
-          _viewerKey.currentState?.loadSeries(selectedPayload);
-          _loadedSeriesUid = selectedPayload.seriesInstanceUid;
-        } catch (e, st) {
-          debugPrint('loadSeries error: $e\n$st');
-          controller.resetToEmptyWithError(
-            'Failed to load series. Please try opening the study again.',
-          );
-        }
-      });
     }
 
     if (isViewerScreen && _appliedTool != state.activeTool) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         try {
-          _viewerKey.currentState?.setTool(state.activeTool);
+          _gridKey.currentState?.setToolAll(state.activeTool);
           _appliedTool = state.activeTool;
         } catch (e, st) {
-          debugPrint('setTool error: $e\n$st');
+          _log.error(_tag, 'setTool error', e, st);
           controller.resetToEmptyWithError(
             'Viewer tool error. Please try opening the study again.',
           );
@@ -84,7 +66,7 @@ class _DicomWorkstationPageState extends ConsumerState<DicomWorkstationPage> {
       if (_thumbnailRequestSessionKey != sessionKey) {
         _thumbnailRequestSessionKey = sessionKey;
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          _viewerKey.currentState?.generateSeriesThumbnails(
+          _gridKey.currentState?.generateSeriesThumbnails(
             viewerSession.seriesPayloads.values.toList(),
           );
         });
@@ -149,12 +131,18 @@ class _DicomWorkstationPageState extends ConsumerState<DicomWorkstationPage> {
                       ? _ViewerWorkspace(
                           state: state,
                           controller: controller,
-                          viewerKey: _viewerKey,
+                          gridKey: _gridKey,
                         )
                       : DicomWebWorklistView(
                           isLoading: state.isWorklistLoading,
                           studies: state.worklistStudies,
                           errorMessage: state.worklistErrorMessage,
+                          availableEndpoints: state.availableEndpoints,
+                          selectedEndpoint: state.selectedEndpoint,
+                          onEndpointChanged: controller.selectEndpoint,
+                          hasMore: state.worklistHasMore,
+                          isLoadingMore: state.isLoadingMoreWorklist,
+                          onLoadMore: controller.loadMoreWorklist,
                           onRefresh: () =>
                               controller.loadPublicWorklist(forceRefresh: true),
                           onOpenStudy: controller.openWorklistStudy,
@@ -169,16 +157,38 @@ class _DicomWorkstationPageState extends ConsumerState<DicomWorkstationPage> {
   }
 }
 
+bool _isMprSupported(DicomViewerState state) {
+  final series = state.selectedSeries;
+  if (series == null) return false;
+  final modality = series.modality.toUpperCase();
+  return mprCapableModalities.contains(modality) &&
+      series.instances.length >= mprMinSliceCount;
+}
+
+/// Builds an ordered list of series payloads for the grid — image series
+/// in the order they appear in the study.
+List<ViewerSeriesPayload> _orderedPayloads(DicomViewerState state) {
+  final session = state.viewerSession;
+  final study = state.selectedStudy;
+  if (session == null || study == null) return const [];
+
+  return study.series
+      .where((s) => s.isImageModality)
+      .map((s) => session.seriesPayloads[s.seriesInstanceUid])
+      .whereType<ViewerSeriesPayload>()
+      .toList();
+}
+
 class _ViewerWorkspace extends StatelessWidget {
   const _ViewerWorkspace({
     required this.state,
     required this.controller,
-    required this.viewerKey,
+    required this.gridKey,
   });
 
   final DicomViewerState state;
   final DicomViewerController controller;
-  final GlobalKey<CornerstoneViewerWidgetState> viewerKey;
+  final GlobalKey<ViewerGridState> gridKey;
 
   @override
   Widget build(BuildContext context) {
@@ -186,13 +196,16 @@ class _ViewerWorkspace extends StatelessWidget {
       return const ViewerEmptyState();
     }
 
+    final payloads = _orderedPayloads(state);
+
     return LayoutBuilder(
       builder: (context, constraints) {
         if (constraints.maxWidth < 1100) {
           return _CompactWorkstation(
             state: state,
             controller: controller,
-            viewerKey: viewerKey,
+            gridKey: gridKey,
+            orderedPayloads: payloads,
           );
         }
 
@@ -213,28 +226,35 @@ class _ViewerWorkspace extends StatelessWidget {
                 children: [
                   Align(
                     alignment: Alignment.centerLeft,
-                    child: ViewerToolbar(
-                      activeTool: state.activeTool,
-                      onToolSelected: (tool) {
-                        controller.setTool(tool);
-                        viewerKey.currentState?.setTool(tool);
-                      },
-                      onReset: () => viewerKey.currentState?.resetViewport(),
-                    ),
+                    child: _buildToolbar(state, controller, gridKey),
                   ),
                   const SizedBox(height: 18),
                   Expanded(
                     child: Stack(
                       children: [
                         Positioned.fill(
-                          child: CornerstoneViewerWidget(
-                            key: viewerKey,
+                          child: ViewerGrid(
+                            key: gridKey,
+                            layout: state.viewerLayout,
                             viewerUrl: state.viewerSession!.viewerUrl,
+                            orderedPayloads: payloads,
+                            activeTool: state.activeTool,
+                            activeSeriesUid:
+                                state.selectedSeries?.seriesInstanceUid,
                             onViewportChanged: controller.updateViewport,
                             onStatusChanged: controller.setViewerStatus,
                             onFatalError: controller.resetToEmptyWithError,
                             onSeriesThumbnailGenerated:
                                 controller.setSeriesThumbnailFromDataUrl,
+                            onImageProgress:
+                                controller.updateSeriesLoadProgress,
+                            onCellTapped: (index) {
+                              if (index < payloads.length) {
+                                controller.selectSeries(
+                                  payloads[index].seriesInstanceUid,
+                                );
+                              }
+                            },
                           ),
                         ),
                         Positioned.fill(child: ViewerOverlayHud(state: state)),
@@ -262,16 +282,47 @@ class _ViewerWorkspace extends StatelessWidget {
   }
 }
 
+Widget _buildToolbar(
+  DicomViewerState state,
+  DicomViewerController controller,
+  GlobalKey<ViewerGridState> gridKey,
+) {
+  return ViewerToolbar(
+    activeTool: state.activeTool,
+    totalImages: state.viewportState.totalImages,
+    viewerLayout: state.viewerLayout,
+    onLayoutChanged: controller.setLayout,
+    onToolSelected: (tool) {
+      controller.setTool(tool);
+      gridKey.currentState?.setToolAll(tool);
+    },
+    onReset: () => gridKey.currentState?.resetAll(),
+    onClearAnnotations: () => gridKey.currentState?.clearAnnotationsAll(),
+    mprSupported: _isMprSupported(state),
+    mprEnabled: state.mprActive,
+    onMprToggle: (enabled) {
+      controller.toggleMpr(enabled);
+      if (enabled) {
+        gridKey.currentState?.enableMprOnPrimary();
+      } else {
+        gridKey.currentState?.disableMprOnPrimary();
+      }
+    },
+  );
+}
+
 class _CompactWorkstation extends StatelessWidget {
   const _CompactWorkstation({
     required this.state,
     required this.controller,
-    required this.viewerKey,
+    required this.gridKey,
+    required this.orderedPayloads,
   });
 
   final DicomViewerState state;
   final DicomViewerController controller;
-  final GlobalKey<CornerstoneViewerWidgetState> viewerKey;
+  final GlobalKey<ViewerGridState> gridKey;
+  final List<ViewerSeriesPayload> orderedPayloads;
 
   @override
   Widget build(BuildContext context) {
@@ -288,28 +339,35 @@ class _CompactWorkstation extends StatelessWidget {
         const SizedBox(height: 18),
         Align(
           alignment: Alignment.centerLeft,
-          child: ViewerToolbar(
-            activeTool: state.activeTool,
-            onToolSelected: (tool) {
-              controller.setTool(tool);
-              viewerKey.currentState?.setTool(tool);
-            },
-            onReset: () => viewerKey.currentState?.resetViewport(),
-          ),
+          child: _buildToolbar(state, controller, gridKey),
         ),
         const SizedBox(height: 18),
         Expanded(
           child: Stack(
             children: [
               Positioned.fill(
-                child: CornerstoneViewerWidget(
-                  key: viewerKey,
+                child: ViewerGrid(
+                  key: gridKey,
+                  layout: state.viewerLayout,
                   viewerUrl: state.viewerSession!.viewerUrl,
+                  orderedPayloads: orderedPayloads,
+                  activeTool: state.activeTool,
+                  activeSeriesUid:
+                      state.selectedSeries?.seriesInstanceUid,
                   onViewportChanged: controller.updateViewport,
                   onStatusChanged: controller.setViewerStatus,
                   onFatalError: controller.resetToEmptyWithError,
                   onSeriesThumbnailGenerated:
                       controller.setSeriesThumbnailFromDataUrl,
+                  onImageProgress:
+                      controller.updateSeriesLoadProgress,
+                  onCellTapped: (index) {
+                    if (index < orderedPayloads.length) {
+                      controller.selectSeries(
+                        orderedPayloads[index].seriesInstanceUid,
+                      );
+                    }
+                  },
                 ),
               ),
               Positioned.fill(child: ViewerOverlayHud(state: state)),

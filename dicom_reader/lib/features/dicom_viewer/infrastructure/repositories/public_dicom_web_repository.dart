@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import '../../../../core/services/app_logger.dart';
 import '../../domain/entities/dicom_models.dart';
 import '../../domain/entities/dicom_web_models.dart';
 import '../../domain/repositories/dicom_web_repository.dart';
@@ -10,6 +11,8 @@ class PublicDicomWebRepository implements DicomWebRepository {
     : _endpoints = endpoints ?? _defaultEndpoints;
 
   final List<DicomWebEndpoint> _endpoints;
+  final AppLogger _log = AppLogger.instance;
+  static const String _tag = 'DICOMwebRepo';
 
   static const List<DicomWebEndpoint> _defaultEndpoints = <DicomWebEndpoint>[
     DicomWebEndpoint(
@@ -39,6 +42,36 @@ class PublicDicomWebRepository implements DicomWebRepository {
       maxSeriesPerStudy: 16,
       maxInstancesPerSeries: 500,
     ),
+    DicomWebEndpoint(
+      id: 'ohif',
+      name: 'OHIF AWS S3 Static WADO',
+      qidoRoot: 'https://d14fa38qiwhyfd.cloudfront.net/dicomweb',
+      wadoUriRoot: 'https://d14fa38qiwhyfd.cloudfront.net/dicomweb',
+      useWadoRs: true,
+      maxStudies: 20,
+      maxSeriesPerStudy: 20,
+      maxInstancesPerSeries: 700,
+    ),
+    DicomWebEndpoint(
+      id: 'ohif2',
+      name: 'OHIF AWS S3 Secondary',
+      qidoRoot: 'https://dd14fa38qiwhyfd.cloudfront.net/dicomweb',
+      wadoUriRoot: 'https://dd14fa38qiwhyfd.cloudfront.net/dicomweb',
+      useWadoRs: true,
+      maxStudies: 20,
+      maxSeriesPerStudy: 20,
+      maxInstancesPerSeries: 700,
+    ),
+    DicomWebEndpoint(
+      id: 'ohif3',
+      name: 'OHIF AWS S3 Tertiary',
+      qidoRoot: 'https://d3t6nz73ql33tx.cloudfront.net/dicomweb',
+      wadoUriRoot: 'https://d3t6nz73ql33tx.cloudfront.net/dicomweb',
+      useWadoRs: true,
+      maxStudies: 20,
+      maxSeriesPerStudy: 20,
+      maxInstancesPerSeries: 700,
+    ),
   ];
 
   @override
@@ -46,9 +79,15 @@ class PublicDicomWebRepository implements DicomWebRepository {
       List<DicomWebEndpoint>.unmodifiable(_endpoints);
 
   @override
-  Future<List<DicomWebWorklistStudy>> fetchWorklistStudies() async {
+  Future<List<DicomWebWorklistStudy>> fetchWorklistStudies({
+    DicomWebEndpoint? endpoint,
+    int offset = 0,
+    int limit = 10,
+  }) async {
+    final targets = endpoint != null ? <DicomWebEndpoint>[endpoint] : _endpoints;
+    _log.info(_tag, 'Fetching worklist (endpoint=${endpoint?.id ?? "all"}, offset=$offset, limit=$limit)');
     final responseSets = await Future.wait(
-      _endpoints.map(_fetchStudiesForEndpoint),
+      targets.map((ep) => _fetchStudiesForEndpoint(ep, offset: offset, limit: limit)),
     );
 
     final merged = responseSets.expand((items) => items).toList()
@@ -65,6 +104,8 @@ class PublicDicomWebRepository implements DicomWebRepository {
 
         return a.patientName.compareTo(b.patientName);
       });
+
+    _log.info(_tag, 'Worklist merged: ${merged.length} studies from ${targets.length} endpoints');
 
     if (merged.isEmpty) {
       throw Exception(
@@ -83,12 +124,16 @@ class PublicDicomWebRepository implements DicomWebRepository {
     final endpoint = study.endpoint;
     final encodedStudyUid = Uri.encodeComponent(study.studyInstanceUid);
 
+    _log.info(_tag, 'Loading study ${study.studyInstanceUid} from ${endpoint.name}');
+
     final seriesRecords = await _getQidoList(
       _qidoUri(endpoint, 'studies/$encodedStudyUid/series', <String, String>{
         'includefield': 'all',
         'limit': endpoint.maxSeriesPerStudy.toString(),
       }),
     );
+
+    _log.info(_tag, 'Found ${seriesRecords.length} series records');
 
     if (seriesRecords.isEmpty) {
       throw Exception('No series were returned for the selected study.');
@@ -104,6 +149,11 @@ class PublicDicomWebRepository implements DicomWebRepository {
 
       final seriesDescription = _readTagString(record, '0008103E');
       final modality = _readTagString(record, '00080060');
+
+      // Skip non-image modalities (SR, PR, RTSTRUCT, KO, etc.).
+      if (DicomSeries.nonImageModalities.contains(modality.toUpperCase())) {
+        continue;
+      }
 
       final instances = await _fetchSeriesInstances(
         endpoint: endpoint,
@@ -161,13 +211,16 @@ class PublicDicomWebRepository implements DicomWebRepository {
   }
 
   Future<List<DicomWebWorklistStudy>> _fetchStudiesForEndpoint(
-    DicomWebEndpoint endpoint,
-  ) async {
+    DicomWebEndpoint endpoint, {
+    int offset = 0,
+    int limit = 10,
+  }) async {
     try {
       final records = await _getQidoList(
         _qidoUri(endpoint, 'studies', <String, String>{
           'includefield': 'all',
-          'limit': endpoint.maxStudies.toString(),
+          'limit': limit.toString(),
+          'offset': offset.toString(),
         }),
       );
 
@@ -196,7 +249,8 @@ class PublicDicomWebRepository implements DicomWebRepository {
       }
 
       return items;
-    } catch (_) {
+    } catch (e, st) {
+      _log.error(_tag, 'Failed to fetch studies from ${endpoint.name}', e, st);
       return const <DicomWebWorklistStudy>[];
     }
   }
@@ -263,7 +317,11 @@ class PublicDicomWebRepository implements DicomWebRepository {
           seriesDescription: resolvedSeriesDescription,
           modality: resolvedModality,
           remoteWadoUri: wadoUri,
-          remoteHeaders: const <String, String>{'Accept': 'application/dicom'},
+          remoteHeaders: <String, String>{
+            'Accept': endpoint.useWadoRs
+                ? 'multipart/related; type="application/dicom", application/dicom'
+                : 'application/dicom',
+          },
         ),
       );
     }
@@ -285,6 +343,21 @@ class PublicDicomWebRepository implements DicomWebRepository {
     required String seriesUid,
     required String sopInstanceUid,
   }) {
+    // WADO-RS: path-based retrieval (static WADO / WADO-RS endpoints)
+    if (endpoint.useWadoRs) {
+      final root = endpoint.wadoUriRoot.isNotEmpty
+          ? endpoint.wadoUriRoot
+          : endpoint.qidoRoot;
+      final normalizedRoot = root.endsWith('/') ? root : '$root/';
+      final base = Uri.parse(normalizedRoot).resolve(
+        'studies/${Uri.encodeComponent(studyUid)}'
+        '/series/${Uri.encodeComponent(seriesUid)}'
+        '/instances/${Uri.encodeComponent(sopInstanceUid)}',
+      );
+      return base.toString();
+    }
+
+    // WADO-URI: query-parameter retrieval (traditional DICOMweb endpoints)
     if (endpoint.wadoUriRoot.isNotEmpty) {
       final base = Uri.parse(endpoint.wadoUriRoot);
       final mergedQuery = Map<String, String>.from(base.queryParameters)
@@ -343,6 +416,7 @@ class PublicDicomWebRepository implements DicomWebRepository {
       });
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
+        _log.warn(_tag, 'QIDO request failed (${response.statusCode}) at $uri');
         throw Exception('QIDO request failed (${response.statusCode}) at $uri');
       }
 

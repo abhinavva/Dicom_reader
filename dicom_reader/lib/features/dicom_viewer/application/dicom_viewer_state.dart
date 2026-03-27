@@ -18,11 +18,21 @@ class DicomViewerState {
     this.bundle,
     this.viewerSession,
     this.worklistStudies = const <DicomWebWorklistStudy>[],
+    this.availableEndpoints = const <DicomWebEndpoint>[],
+    this.selectedEndpoint,
+    this.worklistPageSize = 10,
+    this.worklistOffset = 0,
+    this.worklistHasMore = true,
+    this.isLoadingMoreWorklist = false,
     this.selectedStudyUid,
     this.selectedSeriesUid,
     this.activeTool = ViewerTool.windowLevel,
+    this.viewerLayout = ViewerLayout.single,
+    this.mprActive = false,
+    this.layoutBeforeMpr,
     this.viewportState = const ViewportOverlayState(),
     this.seriesThumbnails = const <String, Uint8List>{},
+    this.seriesLoadProgress = const <String, double>{},
     this.errorMessage,
     this.worklistErrorMessage,
     this.noticeMessage,
@@ -35,11 +45,21 @@ class DicomViewerState {
   final DicomStudyBundle? bundle;
   final ViewerStudySession? viewerSession;
   final List<DicomWebWorklistStudy> worklistStudies;
+  final List<DicomWebEndpoint> availableEndpoints;
+  final DicomWebEndpoint? selectedEndpoint;
+  final int worklistPageSize;
+  final int worklistOffset;
+  final bool worklistHasMore;
+  final bool isLoadingMoreWorklist;
   final String? selectedStudyUid;
   final String? selectedSeriesUid;
   final ViewerTool activeTool;
+  final ViewerLayout viewerLayout;
+  final bool mprActive;
+  final ViewerLayout? layoutBeforeMpr;
   final ViewportOverlayState viewportState;
   final Map<String, Uint8List> seriesThumbnails;
+  final Map<String, double> seriesLoadProgress;
   final String? errorMessage;
   final String? worklistErrorMessage;
   final String? noticeMessage;
@@ -97,11 +117,21 @@ class DicomViewerState {
     Object? bundle = _keep,
     Object? viewerSession = _keep,
     Object? worklistStudies = _keep,
+    Object? availableEndpoints = _keep,
+    Object? selectedEndpoint = _keep,
+    int? worklistPageSize,
+    int? worklistOffset,
+    bool? worklistHasMore,
+    bool? isLoadingMoreWorklist,
     Object? selectedStudyUid = _keep,
     Object? selectedSeriesUid = _keep,
     ViewerTool? activeTool,
+    ViewerLayout? viewerLayout,
+    bool? mprActive,
+    Object? layoutBeforeMpr = _keep,
     ViewportOverlayState? viewportState,
     Object? seriesThumbnails = _keep,
+    Object? seriesLoadProgress = _keep,
     Object? errorMessage = _keep,
     Object? worklistErrorMessage = _keep,
     Object? noticeMessage = _keep,
@@ -124,6 +154,18 @@ class DicomViewerState {
           : List<DicomWebWorklistStudy>.from(
               worklistStudies as List<DicomWebWorklistStudy>,
             ),
+      availableEndpoints: identical(availableEndpoints, _keep)
+          ? this.availableEndpoints
+          : List<DicomWebEndpoint>.from(
+              availableEndpoints as List<DicomWebEndpoint>,
+            ),
+      selectedEndpoint: identical(selectedEndpoint, _keep)
+          ? this.selectedEndpoint
+          : selectedEndpoint as DicomWebEndpoint?,
+      worklistPageSize: worklistPageSize ?? this.worklistPageSize,
+      worklistOffset: worklistOffset ?? this.worklistOffset,
+      worklistHasMore: worklistHasMore ?? this.worklistHasMore,
+      isLoadingMoreWorklist: isLoadingMoreWorklist ?? this.isLoadingMoreWorklist,
       selectedStudyUid: identical(selectedStudyUid, _keep)
           ? this.selectedStudyUid
           : selectedStudyUid as String?,
@@ -131,11 +173,21 @@ class DicomViewerState {
           ? this.selectedSeriesUid
           : selectedSeriesUid as String?,
       activeTool: activeTool ?? this.activeTool,
+      viewerLayout: viewerLayout ?? this.viewerLayout,
+      mprActive: mprActive ?? this.mprActive,
+      layoutBeforeMpr: identical(layoutBeforeMpr, _keep)
+          ? this.layoutBeforeMpr
+          : layoutBeforeMpr as ViewerLayout?,
       viewportState: viewportState ?? this.viewportState,
       seriesThumbnails: identical(seriesThumbnails, _keep)
           ? this.seriesThumbnails
           : Map<String, Uint8List>.from(
               seriesThumbnails as Map<String, Uint8List>,
+            ),
+      seriesLoadProgress: identical(seriesLoadProgress, _keep)
+          ? this.seriesLoadProgress
+          : Map<String, double>.from(
+              seriesLoadProgress as Map<String, double>,
             ),
       errorMessage: identical(errorMessage, _keep)
           ? this.errorMessage

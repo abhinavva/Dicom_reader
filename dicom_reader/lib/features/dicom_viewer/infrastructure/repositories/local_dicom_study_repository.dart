@@ -121,18 +121,27 @@ class LocalDicomStudyRepository implements StudyRepository {
                       });
 
                 final seriesRepresentative = seriesEntry.value.first;
+                final seriesModality = seriesRepresentative.modality.isEmpty
+                    ? 'OT'
+                    : seriesRepresentative.modality;
+
+                // Skip non-image modalities (SR, PR, RTSTRUCT, KO, etc.).
+                if (DicomSeries.nonImageModalities.contains(
+                  seriesModality.toUpperCase(),
+                )) {
+                  return null;
+                }
+
                 return DicomSeries(
                   studyInstanceUid: seriesRepresentative.studyInstanceUid,
                   seriesInstanceUid: seriesRepresentative.seriesInstanceUid,
                   description: seriesRepresentative.seriesDescription.isEmpty
                       ? 'Unnamed Series'
                       : seriesRepresentative.seriesDescription,
-                  modality: seriesRepresentative.modality.isEmpty
-                      ? 'OT'
-                      : seriesRepresentative.modality,
+                  modality: seriesModality,
                   instances: sortedInstances,
                 );
-              }).toList()..sort((a, b) {
+              }).whereType<DicomSeries>().toList()..sort((a, b) {
                 final modalityOrder = a.modality.compareTo(b.modality);
                 if (modalityOrder != 0) {
                   return modalityOrder;

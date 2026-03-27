@@ -85,6 +85,12 @@ class DicomWebWorklistView extends StatelessWidget {
     required this.errorMessage,
     required this.onRefresh,
     required this.onOpenStudy,
+    required this.availableEndpoints,
+    required this.selectedEndpoint,
+    required this.onEndpointChanged,
+    required this.hasMore,
+    required this.isLoadingMore,
+    required this.onLoadMore,
   });
 
   final bool isLoading;
@@ -92,6 +98,12 @@ class DicomWebWorklistView extends StatelessWidget {
   final String? errorMessage;
   final VoidCallback onRefresh;
   final ValueChanged<DicomWebWorklistStudy> onOpenStudy;
+  final List<DicomWebEndpoint> availableEndpoints;
+  final DicomWebEndpoint? selectedEndpoint;
+  final ValueChanged<DicomWebEndpoint?> onEndpointChanged;
+  final bool hasMore;
+  final bool isLoadingMore;
+  final VoidCallback onLoadMore;
 
   @override
   Widget build(BuildContext context) {
@@ -113,14 +125,23 @@ class DicomWebWorklistView extends StatelessWidget {
               ),
             ],
           ),
-          const SizedBox(height: 10),
-          Text(
-            'Open any row to fetch series/instances via QIDO and stream images via WADO into the viewer.',
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-              color: AppTheme.onSurface.withValues(alpha: 0.78),
-            ),
-          ),
+          // const SizedBox(height: 10),
+          // Text(
+          //   'Open any row to fetch series/instances via QIDO and stream images via WADO into the viewer.',
+          //   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+          //     color: AppTheme.onSurface.withValues(alpha: 0.78),
+          //   ),
+          // ),
           const SizedBox(height: 14),
+          if (availableEndpoints.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 14),
+              child: _EndpointSelector(
+                endpoints: availableEndpoints,
+                selected: selectedEndpoint,
+                onChanged: onEndpointChanged,
+              ),
+            ),
           Expanded(
             child: switch ((isLoading, studies.isEmpty)) {
               (true, true) => const Center(child: CircularProgressIndicator()),
@@ -129,9 +150,27 @@ class DicomWebWorklistView extends StatelessWidget {
                 onRefresh: onRefresh,
               ),
               _ => ListView.separated(
-                itemCount: studies.length,
+                itemCount: studies.length + (hasMore ? 1 : 0),
                 separatorBuilder: (_, _) => const SizedBox(height: 12),
                 itemBuilder: (context, index) {
+                  if (index == studies.length) {
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      child: Center(
+                        child: isLoadingMore
+                            ? const SizedBox(
+                                width: 24,
+                                height: 24,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : FilledButton.tonalIcon(
+                                onPressed: onLoadMore,
+                                icon: const Icon(Icons.expand_more_rounded),
+                                label: const Text('Load More'),
+                              ),
+                      ),
+                    );
+                  }
                   final study = studies[index];
                   return _WorklistStudyCard(
                     study: study,
@@ -286,6 +325,75 @@ class _WorklistEmpty extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _EndpointSelector extends StatelessWidget {
+  const _EndpointSelector({
+    required this.endpoints,
+    required this.selected,
+    required this.onChanged,
+  });
+
+  final List<DicomWebEndpoint> endpoints;
+  final DicomWebEndpoint? selected;
+  final ValueChanged<DicomWebEndpoint?> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        const Icon(Icons.dns_rounded, size: 18, color: AppTheme.accent),
+        const SizedBox(width: 8),
+        Text('Server:', style: Theme.of(context).textTheme.labelLarge),
+        const SizedBox(width: 10),
+        Expanded(
+          child: DropdownButtonFormField<String>(
+            value: selected?.id,
+            decoration: InputDecoration(
+              isDense: true,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 10,
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: BorderSide(
+                  color: AppTheme.onSurface.withValues(alpha: 0.12),
+                ),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: BorderSide(
+                  color: AppTheme.onSurface.withValues(alpha: 0.12),
+                ),
+              ),
+              filled: true,
+              fillColor: AppTheme.onSurface.withValues(alpha: 0.04),
+            ),
+            items: [
+              const DropdownMenuItem<String>(
+                value: null,
+                child: Text('All Servers'),
+              ),
+              for (final endpoint in endpoints)
+                DropdownMenuItem<String>(
+                  value: endpoint.id,
+                  child: Text(endpoint.name),
+                ),
+            ],
+            onChanged: (id) {
+              if (id == null) {
+                onChanged(null);
+              } else {
+                final match = endpoints.firstWhere((e) => e.id == id);
+                onChanged(match);
+              }
+            },
+          ),
+        ),
+      ],
     );
   }
 }
